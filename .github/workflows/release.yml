@@ -1,207 +1,54 @@
-name: Release
+name: Desktop beta
 
 on:
-  release:
-    types: [published]
-  workflow_call:
-    inputs:
-      tag:
-        required: true
-        type: string
-      commit:
-        required: true
-        type: string
-      target:
-        default: all
-        type: string
   workflow_dispatch:
     inputs:
-      target:
-        description: Build target
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - snap
-          - macos
-      # Rebuild an already-published release from the commit its tag points at.
       tag:
-        description: Existing release tag to rebuild (optional)
-        default: ''
+        description: Existing beta release tag
+        required: true
         type: string
 
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-beta-${{ inputs.tag }}
+  cancel-in-progress: false
+
 env:
-  RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
-  # Mirrors .cargo/config.toml so rebuilding a commit that predates the bump
-  # still gives rustc 1.99 enough stack.
+  RELEASE_TAG: ${{ inputs.tag }}
   RUST_MIN_STACK: "67108864"
 
 jobs:
-  build-appimage:
-    # `macos` rebuilds only the dmg of an existing release.
-    if: inputs.target != 'macos'
+  regressions:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.commit || inputs.tag || github.sha }}
-          # Full history so build.rs can measure the distance from the
-          # release tag; a shallow clone would label the build `+g<hash>`.
-          fetch-depth: 0
-
-      - name: Validate package versions
-        id: version
-        shell: bash
-        run: python3 scripts/release.py versions --tag "$RELEASE_TAG"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y \
-            libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
-            libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev \
-            librsvg2-bin fuse libfuse2
-
-      - name: Build
-        env:
-          OCS_PATREON_TOKEN: ${{ secrets.OCS_PATREON_TOKEN }}
-        run: cargo build --locked --release
-
-      - name: Prepare AppDir
+          sudo apt-get install -y libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev
+      - name: Verify beta version
         run: |
-          mkdir -p AppDir/usr/bin
-          mkdir -p AppDir/usr/share/applications
-          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-          mkdir -p AppDir/usr/share/metainfo
-          cp target/release/OpenCADStudio AppDir/usr/bin/OpenCADStudio
-          cp packaging/OpenCADStudio.desktop AppDir/usr/share/applications/io.github.HakanSeven12.OpenCadStudio.desktop
-          cp packaging/io.github.HakanSeven12.OpenCadStudio.metainfo.xml AppDir/usr/share/metainfo/
-          rsvg-convert -w 256 -h 256 assets/logo.svg \
-            -o AppDir/usr/share/icons/hicolor/256x256/apps/io.github.HakanSeven12.OpenCadStudio.png
-
-      - name: Pack shared Linux payload
-        run: tar -C AppDir -czf linux-payload.tar.gz usr
-
-      - name: Upload shared Linux payload
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-payload
-          path: linux-payload.tar.gz
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Download linuxdeploy
-        run: |
-          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          chmod +x linuxdeploy-x86_64.AppImage
-
-      - name: Build AppImage
+          python3 scripts/beta_release.py versions --tag "$RELEASE_TAG"
+          python3 scripts/test_beta_release.py
+      - name: Test combined fixes
         env:
-          APPIMAGE_EXTRACT_AND_RUN: 1
+          LC_ALL: C
         run: |
-          ./linuxdeploy-x86_64.AppImage \
-            --appdir AppDir \
-            --desktop-file AppDir/usr/share/applications/io.github.HakanSeven12.OpenCadStudio.desktop \
-            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/io.github.HakanSeven12.OpenCadStudio.png \
-            --output appimage
-          mv Open*CAD*Studio*.AppImage OpenCADStudio.AppImage
-
-      - name: Upload AppImage to release
-        if: env.RELEASE_TAG != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          ASSET=OpenCADStudio-${{ env.RELEASE_TAG }}-linux-x86_64.AppImage
-          mv OpenCADStudio.AppImage "$ASSET"
-          gh release upload ${{ env.RELEASE_TAG }} "$ASSET" --clobber --repo ${{ github.repository }}
-
-  build-snap:
-    needs: build-appimage
-    runs-on: ubuntu-22.04
-    timeout-minutes: 75
-    concurrency:
-      group: snap
-      cancel-in-progress: false
-    permissions:
-      actions: read
-      contents: write
-    env:
-      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.commit || inputs.tag || github.sha }}
-          # Full history so build.rs can measure the distance from the
-          # release tag; a shallow clone would label the build `+g<hash>`.
-          fetch-depth: 0
-
-      - name: Validate package versions
-        id: version
-        shell: bash
-        run: python3 scripts/release.py versions --tag "$RELEASE_TAG"
-
-      - name: Download shared Linux payload
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-payload
-          path: .
-
-      - name: Set package version
-        id: package
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          sed -i "s/^version: .*/version: '$VERSION'/" snap/snapcraft.yaml
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Build snap
-        id: snapcraft
-        uses: snapcore/action-build@v1
-
-      - name: Normalize snap package name
-        id: snap_package
-        env:
-          SNAP: ${{ steps.snapcraft.outputs.snap }}
-          VERSION: ${{ steps.package.outputs.version }}
-        run: |
-          PACKAGE="OpenCADStudio-v${VERSION}-linux-x86_64.snap"
-          mv "$SNAP" "$PACKAGE"
-          echo "snap=$PACKAGE" >> "$GITHUB_OUTPUT"
-
-      - name: Upload snap to release
-        if: env.RELEASE_TAG != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SNAP: ${{ steps.snap_package.outputs.snap }}
-        run: gh release upload "${{ env.RELEASE_TAG }}" "$SNAP" --clobber
-
-      - name: Upload snap as workflow artifact
-        if: env.RELEASE_TAG == ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: OpenCADStudio-v${{ steps.package.outputs.version }}-linux-x86_64-snap
-          path: ${{ steps.snap_package.outputs.snap }}
-          if-no-files-found: error
-
-      - name: Publish snap to edge
-        if: env.RELEASE_TAG != '' && env.SNAPCRAFT_STORE_CREDENTIALS != ''
-        uses: snapcore/action-publish@v1
-        with:
-          snap: ${{ steps.snap_package.outputs.snap }}
-          release: edge
+          cargo test --lib scroll_intent_tests --locked
+          cargo test --lib transparency_ --locked
 
   build-windows:
-    if: (github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all') && inputs.target != 'macos'
+    timeout-minutes: 90
     runs-on: windows-latest
     permissions:
       contents: write
@@ -215,15 +62,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.commit || inputs.tag || github.sha }}
+          ref: ${{ inputs.tag }}
           # Full history so build.rs can measure the distance from the
           # release tag; a shallow clone would label the build `+g<hash>`.
           fetch-depth: 0
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Validate package versions
         id: version
         shell: bash
-        run: python3 scripts/release.py versions --tag "$RELEASE_TAG"
+        run: python3 scripts/beta_release.py versions --tag "$RELEASE_TAG"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-beta
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -256,6 +111,12 @@ jobs:
         run: |
           cargo build --locked --release
           cargo build --locked --release -p dwg-thumbnailer-win
+
+      - name: Verify executable version
+        shell: pwsh
+        run: |
+          $version = & target\release\OpenCADStudio.exe --version
+          if ($LASTEXITCODE -ne 0 -or $version[0] -ne "OpenCADStudio $($env:RELEASE_TAG.Substring(1))") { throw "Unexpected executable version: $version" }
 
       # Forks do not inherit repository secrets, so every signing step is
       # gated on its credentials being present and the pipeline falls through:
@@ -386,12 +247,17 @@ jobs:
           $msi = "OpenCADStudio-$tag-windows-x86_64-installer.msi"
           Move-Item target\release\OpenCADStudio.exe $exe
           Move-Item OpenCADStudio.msi $msi
+          $checksums = "OpenCADStudio-$tag-windows-SHA256SUMS.txt"
+          @($exe, $msi) | ForEach-Object {
+            $hash = (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower()
+            "$hash  $_"
+          } | Set-Content $checksums -Encoding ascii
           gh release upload $tag `
-            $exe $msi `
+            $exe $msi $checksums `
             --clobber --repo ${{ github.repository }}
 
   build-macos:
-    if: github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all' || inputs.target == 'macos'
+    timeout-minutes: 90
     runs-on: macos-14    # Apple Silicon (arm64) only
     permissions:
       contents: write
@@ -400,15 +266,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.commit || inputs.tag || github.sha }}
+          ref: ${{ inputs.tag }}
           # Full history so build.rs can measure the distance from the
           # release tag; a shallow clone would label the build `+g<hash>`.
           fetch-depth: 0
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Validate package versions
         id: version
         shell: bash
-        run: python3 scripts/release.py versions --tag "$RELEASE_TAG"
+        run: python3 scripts/beta_release.py versions --tag "$RELEASE_TAG"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-beta
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -429,6 +303,11 @@ jobs:
           # The launcher shim is the .app's actual CFBundleExecutable (#1039)
           # — see src/bin/ocs_launcher.rs for why.
           cargo build --locked --release --target aarch64-apple-darwin --bin ocs_launcher
+
+      - name: Verify executable version
+        run: |
+          VERSION=$(target/aarch64-apple-darwin/release/OpenCADStudio --version | head -1)
+          test "$VERSION" = "OpenCADStudio ${RELEASE_TAG#v}"
 
       - name: Build .icns from SVG
         run: |
@@ -584,32 +463,32 @@ jobs:
           mv OpenCADStudio.dmg "$ASSET"
           gh release upload ${{ env.RELEASE_TAG }} "$ASSET" --clobber --repo ${{ github.repository }}
 
-      - name: Emit Homebrew cask sha256
-        if: env.RELEASE_TAG != ''
+      - name: Upload macOS checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${{ env.RELEASE_TAG }}"
-          VERSION="${VERSION#v}"
-          SHA=$(shasum -a 256 OpenCADStudio-${{ env.RELEASE_TAG }}-macos-arm64.dmg | awk '{print $1}')
-          {
-            echo "## Homebrew cask bump"
-            echo "Update \`packaging/homebrew/open-cad-studio.rb\`:"
-            echo '```ruby'
-            echo "  version \"$VERSION\""
-            echo "  sha256 \"$SHA\""
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          ASSET="OpenCADStudio-${RELEASE_TAG}-macos-arm64.dmg"
+          SUMS="OpenCADStudio-${RELEASE_TAG}-macos-SHA256SUMS.txt"
+          shasum -a 256 "$ASSET" > "$SUMS"
+          gh release upload "$RELEASE_TAG" "$SUMS" --clobber --repo "${{ github.repository }}"
 
-  verify:
-    needs: [build-appimage, build-snap, build-windows, build-macos]
-    if: github.event_name == 'release' || inputs.tag != ''
+  verify-and-publish:
+    needs: [regressions, build-windows, build-macos]
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.commit || inputs.tag || github.sha }}
-      - name: Verify native release assets and notes
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify all downloads before publishing the beta
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release.py verify-native --tag "$RELEASE_TAG"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/beta_release.py verify --tag "$RELEASE_TAG" --repo "${{ github.repository }}"
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false --repo "${{ github.repository }}"
