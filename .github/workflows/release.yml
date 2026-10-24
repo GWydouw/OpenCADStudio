@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: desktop-beta-${{ inputs.tag }}
+  group: desktop-beta-${{ inputs.tag }}-${{ inputs.target || 'all' }}
   cancel-in-progress: false
 
 env:
